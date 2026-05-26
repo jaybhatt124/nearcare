@@ -1,0 +1,83 @@
+======================================================
+  NearCares — MongoDB + Mappls Version
+  HOW TO RUN
+======================================================
+
+STEP 1 — GET MAPPLS API KEYS
+─────────────────────────────
+1. Go to https://apis.mappls.com/console/
+2. Click "Sign Up" — use your email (free account)
+3. After login → click "Create New App"
+4. Give it a name like "NearCares"
+5. You will get 4 keys:
+     • REST API Key      → put in MAPPLS_REST_KEY
+     • Map SDK Key       → put in MAPPLS_MAP_KEY
+     • Client ID         → put in MAPPLS_CLIENT_ID
+     • Client Secret     → put in MAPPLS_CLIENT_SECRET
+
+   Note: The REST key and Map SDK key are often the same key.
+         The Client ID + Secret are needed for OAuth2 token-based
+         calls (Nearby Search, Geocoding).
+
+STEP 2 — INSTALL MONGODB
+──────────────────────────
+Option A: Local MongoDB (free, offline)
+  • Download from https://www.mongodb.com/try/download/community
+  • Install and start the service
+  • Default URI: mongodb://localhost:27017
+
+Option B: MongoDB Atlas (free cloud, no install)
+  • Go to https://cloud.mongodb.com
+  • Create a free cluster (M0 tier — always free)
+  • Click "Connect" → get your connection string
+  • Example: mongodb+srv://user:pass@cluster0.abc.mongodb.net/
+
+STEP 3 — CONFIGURE .env
+─────────────────────────
+Copy .env.example to .env and fill in:
+
+  MONGO_URI=mongodb://localhost:27017        ← or Atlas URI
+  MONGO_DB=nearcares
+  MAPPLS_REST_KEY=your_28_char_key
+  MAPPLS_MAP_KEY=your_28_char_key
+  MAPPLS_CLIENT_ID=your_client_id
+  MAPPLS_CLIENT_SECRET=your_client_secret
+  ADMIN_USER=admin
+  ADMIN_PASS=admin123
+
+STEP 4 — INSTALL PYTHON PACKAGES
+───────────────────────────────────
+  pip install flask python-dotenv requests "pymongo[srv]"
+
+  (No mysql-connector needed anymore)
+
+STEP 5 — RUN
+──────────────
+  python app.py
+
+  Open: http://localhost:5000
+  Admin: http://localhost:5000/admin
+
+======================================================
+WHAT CHANGED FROM OLD VERSION
+======================================================
+
+  MySQL              →  MongoDB (pymongo)
+  mysql.connector    →  pymongo
+  db_setup.sql       →  Not needed (MongoDB is schema-less)
+  Geoapify API       →  Mappls Nearby API
+  Geoapify tiles     →  Mappls Map SDK (Indian map tiles)
+  Leaflet.js         →  Mappls Web SDK (built on Maplibre)
+  GEOAPIFY_KEY       →  MAPPLS_REST_KEY + MAPPLS_MAP_KEY
+
+======================================================
+MAPPLS API ENDPOINTS USED
+======================================================
+
+  Map tiles:       https://apis.mappls.com/advancedmaps/api/{key}/map_sdk_plugins
+  Token:           https://outpost.mappls.com/api/security/oauth/token
+  Nearby Search:   https://atlas.mappls.com/api/places/nearby/json
+  Geocoding:       https://atlas.mappls.com/api/places/geocode
+  Reverse Geocode: https://atlas.mappls.com/api/places/revegeocoding/json
+
+======================================================
