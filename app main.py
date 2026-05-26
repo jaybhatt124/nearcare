@@ -3,12 +3,6 @@ NearCares - Migrated Version
   - MongoDB  (replaces MySQL)
   - Mappls API  (replaces Geoapify)
   - Mappls Map SDK  (replaces Leaflet + Geoapify tiles)
-
-VERCEL FIXES vs original:
-  1. DATA_DIR → /tmp  (Vercel root fs is read-only; only /tmp is writable)
-  2. MONGO_URI default is '' not 'mongodb://localhost:27017'  (localhost doesn't exist on Vercel)
-  3. MongoDB block won't crash startup if MONGO_URI is missing
-  4. app.run() only called locally — Vercel uses api/index.py as WSGI handler
 """
 
 from flask import Flask, render_template, request, jsonify, redirect, url_for, session, flash
@@ -26,26 +20,19 @@ except ImportError:
     print("⚠️  Install python-dotenv: pip install python-dotenv")
 
 # ── MongoDB ────────────────────────────────────────────────────────────────
-# FIX 1: default is '' so missing MONGO_URI won't try to connect to localhost
-MONGO_OK       = False
-hospitals_col  = None
-contacts_col   = None
-diseases_col   = None
-
 try:
     from pymongo import MongoClient, DESCENDING
-    MONGO_URI = os.environ.get('MONGO_URI', '')
-    if not MONGO_URI:
-        raise ValueError("MONGO_URI env var not set — falling back to JSON")
-    _client = MongoClient(MONGO_URI, serverSelectionTimeoutMS=5000)
-    _client.server_info()           # will raise if unreachable
-    _db            = _client[os.environ.get('MONGO_DB', 'nearcares')]
+    MONGO_URI = os.environ.get('MONGO_URI', 'mongodb://localhost:27017')
+    _client   = MongoClient(MONGO_URI, serverSelectionTimeoutMS=3000)
+    _client.server_info()          # test connection
+    _db       = _client[os.environ.get('MONGO_DB', 'nearcares')]
     hospitals_col  = _db['hospitals']
     contacts_col   = _db['contacts']
     diseases_col   = _db['diseases']
-    MONGO_OK       = True
+    MONGO_OK = True
     print("✅ MongoDB connected")
 except Exception as e:
+    MONGO_OK = False
     print(f"⚠️  MongoDB not available: {e} — using JSON fallback")
 
 app = Flask(__name__)
@@ -55,25 +42,22 @@ ADMIN_USERNAME = os.environ.get('ADMIN_USER', 'admin')
 ADMIN_PASSWORD = os.environ.get('ADMIN_PASS', 'admin123')
 
 # ── Mappls keys ────────────────────────────────────────────────────────────
-MAPPLS_REST_KEY = os.environ.get('MAPPLS_REST_KEY', '')
-MAPPLS_MAP_KEY  = os.environ.get('MAPPLS_MAP_KEY', '')
+# Get these from https://apis.mappls.com/console/
+MAPPLS_REST_KEY   = os.environ.get('MAPPLS_REST_KEY', '')    # REST API key
+MAPPLS_MAP_KEY    = os.environ.get('MAPPLS_MAP_KEY', '')     # Map SDK key (same key usually)
 
 if not MAPPLS_REST_KEY:
     print("⚠️  MAPPLS_REST_KEY not set — hospital search will not work")
 
 # ══════════════════════════════════════════════════════════════════════════
-# JSON FALLBACK — FIX 2: /tmp is the only writable dir on Vercel
+# JSON FALLBACK (when MongoDB is not available)
 # ══════════════════════════════════════════════════════════════════════════
 
-DATA_DIR       = os.path.join('/tmp', 'nearcares_data')
+DATA_DIR       = os.path.join(os.path.abspath(os.path.dirname(__file__)), 'data')
 CONTACTS_FILE  = os.path.join(DATA_DIR, 'contacts.json')
 HOSPITALS_FILE = os.path.join(DATA_DIR, 'hospitals.json')
 DISEASES_FILE  = os.path.join(DATA_DIR, 'diseases.json')
-
-try:
-    os.makedirs(DATA_DIR, exist_ok=True)
-except Exception as e:
-    print(f"⚠️  Could not create DATA_DIR ({DATA_DIR}): {e}")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 def _load_json(path):
     try:
@@ -202,11 +186,15 @@ def db_delete_disease(did):
     _save_json(DISEASES_FILE, data)
 
 # ══════════════════════════════════════════════════════════════════════════
-# MAPPLS API
+# MAPPLS NEARBY API
 # ══════════════════════════════════════════════════════════════════════════
 
 def mappls_get_token():
-    """OAuth2 client_credentials flow — token valid ~24 h."""
+    """
+    Mappls uses OAuth2. Exchange client_id + client_secret for an access token.
+    Store CLIENT_ID and CLIENT_SECRET separately in .env.
+    The token is valid for 24 hours — for production, cache it.
+    """
     client_id     = os.environ.get('MAPPLS_CLIENT_ID', '')
     client_secret = os.environ.get('MAPPLS_CLIENT_SECRET', '')
     if not client_id or not client_secret:
@@ -214,9 +202,11 @@ def mappls_get_token():
     try:
         resp = requests.post(
             'https://outpost.mappls.com/api/security/oauth/token',
-            data={'grant_type': 'client_credentials',
-                  'client_id': client_id, 'client_secret': client_secret},
-            timeout=10
+            data={
+                'grant_type':    'client_credentials',
+                'client_id':     client_id,
+                'client_secret': client_secret,
+            }, timeout=10
         )
         if resp.status_code == 200:
             return resp.json().get('access_token')
@@ -226,50 +216,64 @@ def mappls_get_token():
 
 
 def mappls_nearby_hospitals(lat, lng, radius=5000, keyword='hospital'):
-    """Mappls Nearby API — returns list of hospital dicts."""
-    token = mappls_get_token() or MAPPLS_REST_KEY
+    """
+    Call Mappls Nearby API to search for hospitals near a location.
+    Correct endpoint: GET atlas.mappls.com/api/places/nearby/json
+    Correct params:   keyword (not keywords), refLocation=lat,lng, region=IND
+    Docs: https://developer.mappls.com/documentation/sdk/Legacy/rest-apis%20Legacy/mappls-maps-near-by-api-example/Readme/
+    """
+    token = mappls_get_token()
+    if not token:
+        token = MAPPLS_REST_KEY   # fallback: use REST key as Bearer token directly
     if not token:
         return []
+
+    # Clamp radius: Mappls max is 10000 m
     radius = min(int(radius), 10000)
+
     try:
         resp = requests.get(
             'https://atlas.mappls.com/api/places/nearby/json',
             params={
-                'keywords':    keyword,
-                'refLocation': f'{lat},{lng}',
-                'radius':      radius,
-                'region':      'IND',
+                'keywords':    keyword,          # keyword string e.g. 'hospital'
+                'refLocation': f'{lat},{lng}',   # lat,lng  (no space)
+                'radius':      radius,           # metres, max 10000
+                'region':      'IND',            # restrict to India
                 'richData':    True,
                 'sortBy':      'dist:asc',
             },
-            headers={'Authorization': f'bearer {token}'},
+            headers={'Authorization': f'bearer {token}'},  # lowercase 'bearer' per Mappls docs
             timeout=15
         )
         print(f"[Mappls Nearby] status={resp.status_code} keyword={keyword}")
         if resp.status_code == 200:
+            data    = resp.json()
             results = []
-            for place in resp.json().get('suggestedLocations', []):
+            for place in data.get('suggestedLocations', []):
+                # Mappls returns distance in metres
+                dist_m = place.get('distance', 0)
                 try:
-                    dist_km = float(place.get('distance', 0)) / 1000
+                    dist_km = float(dist_m) / 1000
                 except Exception:
                     dist_km = 0.0
                 results.append({
-                    'name':           place.get('placeName', 'Healthcare Facility'),
-                    'address':        place.get('placeAddress', ''),
-                    'lat':            float(place.get('latitude',  lat)),
-                    'lng':            float(place.get('longitude', lng)),
-                    'distance':       round(dist_km, 2),
-                    'type':           'Hospital',
-                    'place_id':       place.get('eLoc', ''),
-                    'phone':          place.get('tel', ''),
-                    'source':         'mappls',
-                    'priority_rank':  0,
-                    'popularity':     5.0,
+                    'name':          place.get('placeName', 'Healthcare Facility'),
+                    'address':       place.get('placeAddress', ''),
+                    'lat':           float(place.get('latitude',  lat)),
+                    'lng':           float(place.get('longitude', lng)),
+                    'distance':      round(dist_km, 2),
+                    'type':          'Hospital',
+                    'place_id':      place.get('eLoc', ''),
+                    'phone':         place.get('tel', ''),
+                    'source':        'mappls',
+                    'priority_rank': 0,
+                    'popularity':    5.0,
                     'display_rating': 0,
                 })
             return results
         elif resp.status_code == 204:
-            print(f"[Mappls Nearby] 204 No results for '{keyword}' near {lat},{lng}")
+            # 204 = No Content — valid response, just no results for this keyword/location
+            print(f"[Mappls Nearby] 204 No results for keyword='{keyword}' near {lat},{lng}")
         else:
             print(f"[Mappls Nearby] Error {resp.status_code}: {resp.text[:300]}")
     except Exception as e:
@@ -278,6 +282,7 @@ def mappls_nearby_hospitals(lat, lng, radius=5000, keyword='hospital'):
 
 
 def mappls_geocode(address):
+    """Convert address string → lat/lng using Mappls Geocoding API."""
     token = mappls_get_token() or MAPPLS_REST_KEY
     if not token:
         return None
@@ -293,7 +298,7 @@ def mappls_geocode(address):
             if items:
                 item = items if isinstance(items, dict) else items[0]
                 return {
-                    'lat': float(item.get('latitude', 0)),
+                    'lat': float(item.get('latitude',  0)),
                     'lng': float(item.get('longitude', 0)),
                     'formatted_address': item.get('formattedAddress', address)
                 }
@@ -303,6 +308,7 @@ def mappls_geocode(address):
 
 
 def mappls_reverse_geocode(lat, lng):
+    """Convert lat/lng → address using Mappls Reverse Geocoding API."""
     token = mappls_get_token() or MAPPLS_REST_KEY
     if not token:
         return None
@@ -314,7 +320,8 @@ def mappls_reverse_geocode(lat, lng):
             timeout=10
         )
         if resp.status_code == 200:
-            addr = resp.json().get('results', {}).get('address', {})
+            result = resp.json()
+            addr   = result.get('results', {}).get('address', {})
             return {
                 'formatted_address': addr.get('formattedAddress', f'{lat},{lng}'),
                 'city':  addr.get('city', ''),
@@ -325,7 +332,7 @@ def mappls_reverse_geocode(lat, lng):
     return None
 
 # ══════════════════════════════════════════════════════════════════════════
-# DOMAIN DATA
+# DOMAIN DATA  (same as original)
 # ══════════════════════════════════════════════════════════════════════════
 
 MULTISPECIALTY_WORDS = [
@@ -337,22 +344,23 @@ MULTISPECIALTY_WORDS = [
 ]
 
 SPECIALTIES = {
-    'orthopedic':    {'label': '🦴 Orthopedic & Bone',       'icon': '🦴', 'keywords': ['ortho','orthopedic','bone','joint','fracture','spine','arthroplasty','arthritis']},
-    'neurology':     {'label': '🧠 Neurology & Brain',        'icon': '🧠', 'keywords': ['neuro','neurology','brain','stroke','epilepsy']},
-    'ent':           {'label': '👂 ENT',                      'icon': '👂', 'keywords': ['ent','ear','nose','throat','sinus','audiolog']},
-    'ophthalmology': {'label': '👁️ Eye Hospital',             'icon': '👁️', 'keywords': ['eye','ophthalm','vision','retina','cataract','netralaya']},
-    'cardiology':    {'label': '❤️ Cardiology & Heart',       'icon': '❤️', 'keywords': ['cardio','cardiac','heart','cardiovascular','angioplasty']},
-    'pulmonology':   {'label': '🫁 Pulmonology & Chest',      'icon': '🫁', 'keywords': ['pulmo','pulmonary','lung','chest','respiratory','asthma']},
-    'gastro':        {'label': '🫃 Gastroenterology',         'icon': '🫃', 'keywords': ['gastro','digestive','intestine','bowel','colonoscopy']},
-    'oncology':      {'label': '🎗️ Cancer & Oncology',        'icon': '🎗️', 'keywords': ['onco','oncology','cancer','tumour','tumor','radiotherapy']},
-    'nephrology':    {'label': '🫘 Kidney & Nephrology',      'icon': '🫘', 'keywords': ['nephro','kidney','renal','dialysis','urology']},
-    'endocrinology': {'label': '💊 Diabetes & Endocrinology', 'icon': '💊', 'keywords': ['endocrin','diabetes','diabetology','hormone','bariatric']},
-    'dermatology':   {'label': '🧴 Skin & Dermatology',       'icon': '🧴', 'keywords': ['derma','skin clinic','cosmet','trichology']},
-    'psychiatry':    {'label': '🧘 Psychiatry & Mental Health','icon': '🧘', 'keywords': ['psychiatr','psychology','mental health','addiction','counselling']},
-    'general':       {'label': '🏥 General Medicine',         'icon': '🏥', 'keywords': ['general medicine','family medicine','polyclinic','nursing home']},
+    'orthopedic':    {'label': '🦴 Orthopedic & Bone',      'icon': '🦴', 'keywords': ['ortho','orthopedic','bone','joint','fracture','spine','arthroplasty','arthritis']},
+    'neurology':     {'label': '🧠 Neurology & Brain',       'icon': '🧠', 'keywords': ['neuro','neurology','brain','stroke','epilepsy']},
+    'ent':           {'label': '👂 ENT',                     'icon': '👂', 'keywords': ['ent','ear','nose','throat','sinus','audiolog']},
+    'ophthalmology': {'label': '👁️ Eye Hospital',            'icon': '👁️', 'keywords': ['eye','ophthalm','vision','retina','cataract','netralaya']},
+    'cardiology':    {'label': '❤️ Cardiology & Heart',      'icon': '❤️', 'keywords': ['cardio','cardiac','heart','cardiovascular','angioplasty']},
+    'pulmonology':   {'label': '🫁 Pulmonology & Chest',     'icon': '🫁', 'keywords': ['pulmo','pulmonary','lung','chest','respiratory','asthma']},
+    'gastro':        {'label': '🫃 Gastroenterology',        'icon': '🫃', 'keywords': ['gastro','digestive','intestine','bowel','colonoscopy']},
+    'oncology':      {'label': '🎗️ Cancer & Oncology',       'icon': '🎗️', 'keywords': ['onco','oncology','cancer','tumour','tumor','radiotherapy']},
+    'nephrology':    {'label': '🫘 Kidney & Nephrology',     'icon': '🫘', 'keywords': ['nephro','kidney','renal','dialysis','urology']},
+    'endocrinology': {'label': '💊 Diabetes & Endocrinology','icon': '💊', 'keywords': ['endocrin','diabetes','diabetology','hormone','bariatric']},
+    'dermatology':   {'label': '🧴 Skin & Dermatology',      'icon': '🧴', 'keywords': ['derma','skin clinic','cosmet','trichology']},
+    'psychiatry':    {'label': '🧘 Psychiatry & Mental Health','icon':'🧘','keywords': ['psychiatr','psychology','mental health','addiction','counselling']},
+    'general':       {'label': '🏥 General Medicine',        'icon': '🏥', 'keywords': ['general medicine','family medicine','polyclinic','nursing home']},
 }
 
 BODY_PART_SPECIALTIES = {
+    # Head region
     'head':       ['neurology', 'ent', 'ophthalmology', 'psychiatry'],
     'brain':      ['neurology', 'psychiatry'],
     'eyes':       ['ophthalmology'],
@@ -361,9 +369,11 @@ BODY_PART_SPECIALTIES = {
     'throat':     ['ent'],
     'mouth':      ['ent'],
     'face':       ['ent', 'dermatology'],
+    # Neck & upper
     'neck':       ['ent', 'neurology', 'orthopedic'],
     'shoulders':  ['orthopedic'],
     'shoulder':   ['orthopedic'],
+    # Chest & core
     'chest':      ['cardiology', 'pulmonology'],
     'heart':      ['cardiology'],
     'lungs':      ['pulmonology'],
@@ -371,14 +381,17 @@ BODY_PART_SPECIALTIES = {
     'abdomen':    ['gastro', 'nephrology'],
     'liver':      ['gastro'],
     'kidney':     ['nephrology'],
+    # Upper limbs
     'arms':       ['orthopedic'],
     'arm':        ['orthopedic'],
     'wrist':      ['orthopedic'],
     'hand':       ['orthopedic'],
     'elbow':      ['orthopedic'],
+    # Spine & back
     'back':       ['orthopedic', 'neurology'],
     'spine':      ['orthopedic', 'neurology'],
     'lower_back': ['orthopedic', 'neurology'],
+    # Lower limbs
     'hips':       ['orthopedic'],
     'hip':        ['orthopedic'],
     'knees':      ['orthopedic'],
@@ -388,10 +401,12 @@ BODY_PART_SPECIALTIES = {
     'ankle':      ['orthopedic'],
     'feet':       ['orthopedic'],
     'foot':       ['orthopedic'],
+    # Skin
     'skin':       ['dermatology'],
 }
 
 ILLNESS_SPECIALTIES = {
+    # General
     'fever':         ['general'],
     'cough':         ['pulmonology', 'ent'],
     'cold':          ['ent', 'general'],
@@ -399,50 +414,64 @@ ILLNESS_SPECIALTIES = {
     'diarrhea':      ['gastro'],
     'vomiting':      ['gastro', 'general'],
     'fatigue':       ['general', 'endocrinology'],
+    # Heart & BP
     'heart_disease': ['cardiology'],
     'bp':            ['cardiology', 'general'],
     'hypertension':  ['cardiology', 'general'],
     'chest_pain':    ['cardiology', 'pulmonology'],
+    # Lungs
     'asthma':        ['pulmonology'],
     'breathing':     ['pulmonology', 'cardiology'],
+    # Gastro
     'liver':         ['gastro'],
     'gastric':       ['gastro'],
     'acidity':       ['gastro'],
     'constipation':  ['gastro'],
+    # Kidney & urology
     'kidney':        ['nephrology'],
     'urinary':       ['nephrology'],
+    # Bone & joints
     'arthritis':     ['orthopedic'],
     'back_pain':     ['orthopedic', 'neurology'],
     'fracture':      ['orthopedic'],
     'joint_pain':    ['orthopedic'],
     'bone':          ['orthopedic'],
+    # Brain & nerves
     'headache':      ['neurology', 'general'],
     'migraine':      ['neurology'],
     'stroke':        ['neurology'],
     'epilepsy':      ['neurology'],
     'paralysis':     ['neurology'],
+    # Eyes
     'eye':           ['ophthalmology'],
     'vision':        ['ophthalmology'],
     'cataract':      ['ophthalmology'],
+    # ENT
     'thyroid':       ['ent', 'endocrinology'],
     'ear_pain':      ['ent'],
     'sinus':         ['ent'],
     'tonsil':        ['ent'],
+    # Skin
     'skin':          ['dermatology'],
     'allergy':       ['dermatology', 'pulmonology'],
     'rash':          ['dermatology'],
     'acne':          ['dermatology'],
+    # Mental health
     'depression':    ['psychiatry'],
     'anxiety':       ['psychiatry'],
     'stress':        ['psychiatry'],
     'insomnia':      ['psychiatry'],
+    # Endocrine
     'diabetes':      ['endocrinology'],
     'obesity':       ['endocrinology'],
     'hormone':       ['endocrinology'],
+    # Cancer
     'cancer':        ['oncology'],
     'tumor':         ['oncology'],
 }
 
+# Keywords to use when calling Mappls Nearby API per specialty
+# These are plain text keywords — Mappls matches against POI names
 SPECIALTY_SEARCH_KEYWORDS = {
     'orthopedic':    ['orthopedic hospital', 'bone hospital', 'ortho clinic', 'joint clinic'],
     'neurology':     ['neurology hospital', 'neuro clinic', 'brain hospital'],
@@ -525,7 +554,8 @@ def index():
     for d in db_get_diseases():
         key = d['name'].lower().replace(' ', '_')
         all_illnesses[key] = {'icon': d.get('icon','💊'), 'label': d['name']}
-    return render_template('index.html', illnesses=all_illnesses, mappls_key=MAPPLS_MAP_KEY)
+    return render_template('index.html', illnesses=all_illnesses,
+                           mappls_key=MAPPLS_MAP_KEY)
 
 @app.route('/hospitals')
 def hospitals():
@@ -693,91 +723,121 @@ def api_search_hospitals():
 
         raw = []
 
-        # 1. Admin-added hospitals from DB
+        # 1. Admin-added hospitals from MongoDB
         for h in db_get_hospitals():
             if not (h.get('lat') and h.get('lng')):
                 continue
             dist = haversine(user_lat, user_lng, float(h['lat']), float(h['lng']))
             if dist <= radius / 1000:
                 raw.append({
-                    'name':           h['name'],
-                    'address':        ' '.join(filter(None, [h.get('address'), h.get('city'), h.get('state')])),
-                    'lat':            float(h['lat']),
-                    'lng':            float(h['lng']),
-                    'distance':       dist,
-                    'type':           'Hospital',
-                    'place_id':       f"db:{h.get('id','')}",
-                    'popularity':     10.0,
-                    'display_rating': 4.8,
-                    'priority_rank':  3,
-                    'source':         'database',
-                    'phone':          h.get('phone','')
+                    'name': h['name'],
+                    'address': ' '.join(filter(None, [h.get('address'), h.get('city'), h.get('state')])),
+                    'lat': float(h['lat']), 'lng': float(h['lng']),
+                    'distance': dist, 'type': 'Hospital',
+                    'place_id': f"db:{h.get('id','')}",
+                    'popularity': 10.0, 'display_rating': 4.8,
+                    'priority_rank': 3, 'source': 'database',
+                    'phone': h.get('phone','')
                 })
 
-        # 2. Mappls Nearby API
+        # 2. Mappls Nearby API — use specialty-specific keywords
+        #    Always search generic hospital/clinic too for multispecialty coverage
         search_keywords = set()
         for sid in needed:
             for kw in SPECIALTY_SEARCH_KEYWORDS.get(sid, ['hospital']):
                 search_keywords.add(kw)
+        # Always add generic to catch multispecialty hospitals
         search_keywords.update(['hospital', 'clinic'])
 
         for keyword in search_keywords:
             places = mappls_nearby_hospitals(user_lat, user_lng, radius=min(radius, 10000), keyword=keyword)
             raw.extend(places)
 
-        # 3. Deduplicate
-        seen, deduped = set(), []
+        # 3. Deduplicate by name (first 35 chars)
+        seen    = set()
+        deduped = []
         for h in sorted(raw, key=lambda x: (-x.get('priority_rank', 0), x['distance'])):
             uid = h['name'].strip().lower()[:35]
-            if uid not in seen:
-                seen.add(uid)
-                deduped.append(h)
+            if uid in seen:
+                continue
+            seen.add(uid)
+            deduped.append(h)
 
-        # 4. Sort
+        # 4. Sort: verified first, then multispecialty, then nearest
         def sort_key(h):
             is_multi = 1 if is_multispecialty(h['name'], h.get('address','')) else 0
             return (-h.get('priority_rank', 0), -is_multi, h['distance'])
         deduped.sort(key=sort_key)
 
-        # 5. Classify
+        # 5. Classify into buckets
         spec_buckets = {s: [] for s in needed}
-        multi_bucket, unmatched = [], []
+        multi_bucket = []
+        unmatched    = []
 
         for h in deduped:
             matched = classify(h, needed)
             if matched:
+                # Specialty-matched hospital → goes into specialty bucket
                 h['specialty_label'] = SPECIALTIES.get(matched[0],{}).get('label', matched[0])
                 spec_buckets[matched[0]].append(h)
             elif is_multispecialty(h['name'], h.get('address','')):
+                # Multispecialty hospital (Apollo, Zydus etc.) → relevant for any search
                 h['specialty_label'] = '⭐ Multispecialty'
                 multi_bucket.append(h)
             else:
+                # Generic clinic/hospital — show at bottom as "Also Nearby"
                 h['specialty_label'] = '🏥 General'
                 unmatched.append(h)
 
-        # 6. Build groups
+        # 6. Build groups in order:
+        #    1. Specialty-specific (e.g. Orthopedic Hospitals)
+        #    2. Multispecialty (Apollo, Zydus — treat all conditions)
+        #    3. All other hospitals nearby (at bottom, optional)
         groups = []
         for sid in needed:
             if spec_buckets.get(sid):
                 sp = SPECIALTIES.get(sid, {})
-                groups.append({'id': sid, 'label': sp.get('label', sid.title()),
-                               'icon': sp.get('icon', '🏥'), 'hospitals': spec_buckets[sid]})
+                groups.append({
+                    'id': sid,
+                    'label': sp.get('label', sid.title()),
+                    'icon': sp.get('icon', '🏥'),
+                    'hospitals': spec_buckets[sid]
+                })
         if multi_bucket:
-            groups.append({'id': 'multispecialty', 'label': '⭐ Multispecialty Hospitals',
-                           'icon': '⭐', 'hospitals': multi_bucket})
+            groups.append({
+                'id': 'multispecialty',
+                'label': '⭐ Multispecialty Hospitals',
+                'icon': '⭐',
+                'hospitals': multi_bucket
+            })
+        # Only show "Also Nearby" if the primary groups have results
         if unmatched and groups:
-            groups.append({'id': 'nearby', 'label': '🏥 Other Hospitals & Clinics Nearby',
-                           'icon': '🏥', 'hospitals': unmatched[:15]})
+            groups.append({
+                'id': 'nearby',
+                'label': '🏥 Other Hospitals & Clinics Nearby',
+                'icon': '🏥',
+                'hospitals': unmatched[:15]   # cap at 15
+            })
+        # Fallback if nothing classified at all
         if not groups and deduped:
-            groups.append({'id': 'general', 'label': '🏥 Hospitals & Clinics near you',
-                           'icon': '🏥', 'hospitals': deduped[:30]})
+            groups.append({
+                'id': 'general',
+                'label': f'🏥 Hospitals & Clinics near you',
+                'icon': '🏥',
+                'hospitals': deduped[:30]
+            })
 
-        trimmed = [({**g, 'hospitals': g['hospitals'][:limit]})
-                   for g in groups if g['hospitals'][:limit]]
+        # Trim each group but always show at least some from each
+        trimmed = []
+        for g in groups:
+            hs = g['hospitals'][:limit]
+            if hs:
+                trimmed.append({**g, 'hospitals': hs})
 
         return jsonify({'success': True, 'groups': trimmed,
-                        'total': sum(len(g['hospitals']) for g in trimmed),
-                        'search_label': label, 'radius_km': radius/1000, 'sort_by': 'distance'})
+            'total': sum(len(g['hospitals']) for g in trimmed),
+            'search_label': label, 'radius_km': radius/1000,
+            'sort_by': 'distance'})
 
     except Exception as e:
         import traceback; traceback.print_exc()
@@ -831,25 +891,23 @@ def api_contact():
 
 @app.route('/api/diseases')
 def api_diseases():
-    combined = [{'key': k, 'label': v['label'], 'icon': v['icon'], 'source': 'builtin'}
-                for k, v in COMMON_ILLNESSES.items()]
+    combined = [{'key':k,'label':v['label'],'icon':v['icon'],'source':'builtin'}
+                for k,v in COMMON_ILLNESSES.items()]
     for d in db_get_diseases():
-        combined.append({'key': d['name'].lower().replace(' ','_'),
-                         'label': d['name'], 'icon': d.get('icon','💊'), 'source': 'custom'})
+        combined.append({'key':d['name'].lower().replace(' ','_'),
+                         'label':d['name'],'icon':d.get('icon','💊'),'source':'custom'})
     return jsonify(combined)
 
 
 @app.route('/api/status')
 def api_status():
     return jsonify({
-        'mongo':               MONGO_OK,
+        'mongo': MONGO_OK,
         'mappls_rest_key_set': bool(MAPPLS_REST_KEY),
         'mappls_map_key_set':  bool(MAPPLS_MAP_KEY),
     })
 
 
-# ══════════════════════════════════════════════════════════════════════════
-# FIX 3: app.run() only for local dev — Vercel uses api/index.py instead
 # ══════════════════════════════════════════════════════════════════════════
 if __name__ == '__main__':
     print("=" * 55)
@@ -858,4 +916,5 @@ if __name__ == '__main__':
     print("🌐  http://localhost:5000")
     print("🔐  http://localhost:5000/admin  (admin / admin123)")
     print("=" * 55)
+    # use_reloader=False fixes WinError 10038 on Windows (Flask socket reloader bug)
     app.run(debug=True, host='0.0.0.0', port=5000, use_reloader=False)

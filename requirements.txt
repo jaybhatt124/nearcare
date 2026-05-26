@@ -1,5 +1,5 @@
 flask>=3.0
 python-dotenv
 requests
-pymongo[srv]       # MongoDB driver  (replaces mysql-connector-python)
+pymongo[srv]     # MongoDB driver  (replaces mysql-connector-python)
 # mysql-connector-python  # no longer needed

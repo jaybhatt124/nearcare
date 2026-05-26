@@ -1,158 +1,39 @@
 /* ============================================================
    NearCares – Hospitals Page JS
-   Original UI preserved exactly.
-   Added: Mappls map shown after search, click → directions
+   Map: "View All on Google Maps" button (reliable, no SDK needed)
+   Click card / Directions → Google Maps navigation
    ============================================================ */
 
 let userLat = null, userLng = null;
 let selectedIllness = null, selectedBodyPart = null;
 let allDiseases = [];
 
-// ── Mappls map state ──────────────────────────────────────────
-let mapplsMap     = null;
-let markerLayer   = [];
-let activePopup   = null;
-let mapReady      = false;
-
 document.addEventListener('DOMContentLoaded', async () => {
   await loadDiseases();
   initSearchBar();
   initFromURL();
-  waitForMapplsSDK();   // load map in background, show when results arrive
 });
 
-// ── Wait for Mappls SDK to load (loaded async in HTML) ────────
-function waitForMapplsSDK() {
-  if (typeof mappls !== 'undefined') {
-    initMap();
-  } else {
-    let tries = 0;
-    const t = setInterval(() => {
-      tries++;
-      if (typeof mappls !== 'undefined') { clearInterval(t); initMap(); }
-      else if (tries > 40) clearInterval(t); // give up after 8s
-    }, 200);
-  }
-}
-
-function initMap() {
-  try {
-    mapplsMap = new mappls.Map('map', {
-      center: [23.0225, 72.5714],
-      zoom:   12,
-      search: false,
-    });
-    mapplsMap.addListener('load', () => {
-      mapReady = true;
-      if (userLat && userLng) {
-        mapplsMap.setCenter([userLat, userLng]);
-        mapplsMap.setZoom(13);
-      }
-    });
-  } catch(e) {
-    console.warn('Mappls map init failed:', e);
-  }
-}
-
-function clearMarkers() {
-  markerLayer.forEach(m => { try { m.setMap(null); } catch(e){} });
-  markerLayer = [];
-  if (activePopup) { try { activePopup.close(); } catch(e){} activePopup = null; }
-}
-
-function addHospitalMarker(h) {
-  if (!mapplsMap || !mapReady) return;
-  try {
-    const marker = new mappls.Marker({
-      map:      mapplsMap,
-      position: [h.lat, h.lng],
-      title:    h.name,
-    });
-    marker.addListener('click', () => showMarkerPopup(marker, h));
-    markerLayer.push(marker);
-  } catch(e) {}
-}
-
-function addUserMarker(lat, lng) {
-  if (!mapplsMap || !mapReady) return;
-  try {
-    const m = new mappls.Marker({
-      map:      mapplsMap,
-      position: [lat, lng],
-      title:    'You are here',
-      icon: {
-        url:    'https://apis.mappls.com/map_v3/1.3/img/marker/mylocation.png',
-        size:   [30, 30],
-        anchor: [15, 30],
-      },
-    });
-    markerLayer.push(m);
-  } catch(e) {}
-}
-
-function showMarkerPopup(marker, h) {
-  if (activePopup) { try { activePopup.close(); } catch(e){} }
-  const mapsUrl = `https://www.google.com/maps/dir/?api=1&destination=${h.lat},${h.lng}`;
-  try {
-    activePopup = new mappls.InfoWindow({
-      map:     mapplsMap,
-      content: `<div style="font-size:13px;max-width:220px;line-height:1.6;padding:2px">
-        <b style="font-size:14px">${h.name}</b><br>
-        <span style="color:#555;font-size:12px">${h.address || ''}</span><br>
-        ${h.distance ? `<span style="color:#3b82f6">📏 ${h.distance} km away</span><br>` : ''}
-        ${h.phone    ? `📞 <a href="tel:${h.phone}" style="color:#007bff">${h.phone}</a><br>` : ''}
-        <a href="${mapsUrl}" target="_blank"
-           style="display:inline-block;margin-top:6px;padding:5px 12px;
-                  background:#007bff;color:#fff;border-radius:6px;
-                  text-decoration:none;font-size:12px;font-weight:600">
-          🗺️ Get Directions
-        </a>
-      </div>`,
-      position: [h.lat, h.lng],
-    });
-  } catch(e) {}
-}
-
+// ── Show "View All on Google Maps" button after results load ──
 function showMap(hospitals) {
-  const container = document.getElementById('mapContainer');
-  if (!container) return;
-  container.style.display = 'block';
+  const btn       = document.getElementById('viewOnMapBtn');
+  const container = document.getElementById('mapBtnContainer');
+  if (!btn || !container || !hospitals.length) return;
 
-  // Hide the "search to see hospitals" hint
-  const hint = document.getElementById('mapHint');
-  if (hint) { hint.style.opacity = '0'; setTimeout(() => hint.style.display = 'none', 400); }
-
-  clearMarkers();
-
-  // Wait for map ready if not yet
-  const doPlace = () => {
-    if (userLat && userLng) {
-      addUserMarker(userLat, userLng);
-      mapplsMap.setCenter([userLat, userLng]);
-      mapplsMap.setZoom(13);
-    }
-    hospitals.forEach(h => { if (h.lat && h.lng) addHospitalMarker(h); });
-
-    // Fit bounds to all markers
-    if (hospitals.length > 0 && userLat) {
-      try {
-        const bounds = new mappls.LatLngBounds();
-        bounds.extend([userLat, userLng]);
-        hospitals.forEach(h => { if (h.lat && h.lng) bounds.extend([h.lat, h.lng]); });
-        mapplsMap.fitBounds(bounds, { padding: 60 });
-      } catch(e) {}
-    }
-  };
-
-  if (mapReady) {
-    doPlace();
+  // Build a Google Maps search URL with all hospital names near user location
+  let url;
+  if (hospitals.length === 1) {
+    url = `https://www.google.com/maps/search/?api=1&query=${encodeURIComponent(hospitals[0].name)}&query_place_id=${hospitals[0].place_id || ''}`;
   } else {
-    // retry until ready
-    let t = setInterval(() => {
-      if (mapReady) { clearInterval(t); doPlace(); }
-    }, 200);
-    setTimeout(() => clearInterval(t), 5000);
+    // Open Google Maps centered on user location searching for hospitals
+    const query = encodeURIComponent('hospitals near me');
+    url = userLat && userLng
+      ? `https://www.google.com/maps/search/hospitals/@${userLat},${userLng},14z`
+      : `https://www.google.com/maps/search/${query}`;
   }
+
+  btn.href = url;
+  container.style.display = 'block';
 }
 
 // ── Load disease list ─────────────────────────────────────────
@@ -230,17 +111,6 @@ function waitForLocationThenSearch() {
 function setLocation(lat, lng, accuracy, resolveAddress) {
   userLat = lat;
   userLng = lng;
-  // Center map on user location as soon as we have it (even before search)
-  if (mapReady && mapplsMap) {
-    mapplsMap.setCenter([lat, lng]);
-    mapplsMap.setZoom(13);
-  } else if (mapplsMap) {
-    // Map not ready yet — set center after it loads
-    mapplsMap.addListener && mapplsMap.addListener('load', () => {
-      mapplsMap.setCenter([lat, lng]);
-      mapplsMap.setZoom(13);
-    });
-  }
   if (resolveAddress) {
     setLocationText('📡 Resolving address…', '');
     fetch('/api/reverse-geocode', {
@@ -509,6 +379,9 @@ function renderResults(data) {
       <h3>No hospitals found</h3>
       <p>Try increasing the radius or <button onclick="showChangeLocationModal()" style="background:none;border:none;color:var(--primary);cursor:pointer;font-weight:700;padding:0;">change location</button></p>
     </div>`);
+    // hide map if no results
+    const mc = document.getElementById('mapContainer');
+    if (mc) mc.style.display = 'none';
     return;
   }
 
@@ -557,34 +430,10 @@ function hospitalCard(h) {
   </div>`;
 }
 
-// Click card → pan map and open popup
+// Click card → open Google Maps directions directly
 function focusOnMap(lat, lng, name, address, distance, phone) {
-  if (!mapplsMap || !mapReady) return;
-  mapplsMap.setCenter([lat, lng]);
-  mapplsMap.setZoom(16);
-  // scroll to map
-  document.getElementById('mapContainer')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
-  // open popup
-  if (activePopup) { try { activePopup.close(); } catch(e){} }
-  const mapsUrl = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
-  try {
-    activePopup = new mappls.InfoWindow({
-      map:     mapplsMap,
-      content: `<div style="font-size:13px;max-width:220px;line-height:1.6;padding:2px">
-        <b style="font-size:14px">${name}</b><br>
-        <span style="color:#555;font-size:12px">${address}</span><br>
-        ${distance ? `<span style="color:#3b82f6">📏 ${distance} km away</span><br>` : ''}
-        ${phone ? `📞 <a href="tel:${phone}" style="color:#007bff">${phone}</a><br>` : ''}
-        <a href="${mapsUrl}" target="_blank"
-           style="display:inline-block;margin-top:6px;padding:5px 12px;
-                  background:#007bff;color:#fff;border-radius:6px;
-                  text-decoration:none;font-size:12px;font-weight:600">
-          🗺️ Get Directions
-        </a>
-      </div>`,
-      position: [lat, lng],
-    });
-  } catch(e) {}
+  const url = `https://www.google.com/maps/dir/?api=1&destination=${lat},${lng}`;
+  window.open(url, '_blank');
 }
 
 function showResults(html) {
